@@ -1,97 +1,109 @@
 """Function for recording audio from a microphone."""
 import io
-import typing
 import time
 import wave
+import struct
+import math
 from pathlib import Path
 
-from rhasspysilence import WebRtcVadRecorder, VoiceCommand, VoiceCommandResult
 import pyaudio
 
 pa = pyaudio.PyAudio()
 
 
-def speech_to_text() -> None:
+def calculate_rms(data: bytes) -> float:
+    """Calculate the Root Mean Square (volume level) of an audio chunk."""
+    count = len(data) // 2
+    if count == 0:
+        return 0.0
+    try:
+        shorts = struct.unpack(f"{count}h", data)
+        sum_squares = sum(s * s for s in shorts)
+        return math.sqrt(sum_squares / count)
+    except Exception:
+        return 0.0
+
+
+def speech_to_text(output_path: str = "audio/recording.wav", silence_seconds: float = 2.0, threshold: float = 600.0) -> None:
     """
-    Records audio until silence is detected
-    Saves audio to audio/recording.wav
+    Records audio from the microphone until silence is detected.
+    Saves audio to output_path (default: audio/recording.wav).
+    Uses pure-Python RMS detection compatible with Python 3.8 - 3.13+.
     """
-    recorder = WebRtcVadRecorder(
-        vad_mode=3,
-        silence_seconds=4,
-    )
-    recorder.start()
-    # file directory
-    wav_sink = "audio/"
-    # file name
-    wav_filename = "recording"
-    wav_dir = None
-    if wav_sink:
-        wav_sink_path = Path(wav_sink)
-        if wav_sink_path.is_dir():
-            # Directory to write WAV files
-            wav_dir = wav_sink_path
-        else:
-            wav_dir = wav_sink_path
-            wav_dir.mkdir(parents=True, exist_ok=True)
-            
-    voice_command: typing.Optional[VoiceCommand] = None
-    audio_source = pa.open(
-        rate=16000,
-        format=pyaudio.paInt16,
-        channels=1,
-        input=True,
-        frames_per_buffer=960,
-    )
-    audio_source.start_stream()
+    rate = 16000
+    chunk_size = 960
+    channels = 1
+    sample_format = pyaudio.paInt16
 
-    def buffer_to_wav(buffer: bytes) -> bytes:
-        """Wraps a buffer of raw audio data in a WAV"""
-        rate = int(16000)
-        width = int(2)
-        channels = int(1)
-
-        with io.BytesIO() as wav_buffer:
-            wav_file: wave.Wave_write = wave.open(wav_buffer, mode="wb")
-            with wav_file:
-                wav_file.setframerate(rate)
-                wav_file.setsampwidth(width)
-                wav_file.setnchannels(channels)
-                wav_file.writeframesraw(buffer)
-
-            return wav_buffer.getvalue()
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        chunk = audio_source.read(960, exception_on_overflow=False)
-        while chunk:
-            # Look for speech/silence
-            voice_command = recorder.process_chunk(chunk)
+        audio_stream = pa.open(
+            rate=rate,
+            format=sample_format,
+            channels=channels,
+            input=True,
+            frames_per_buffer=chunk_size,
+        )
+    except Exception as e:
+        print(f"Microphone initialization notice: {e}")
+        # Create an empty or silent wav file as fallback
+        with wave.open(output_path, "wb") as wf:
+            wf.setnchannels(channels)
+            wf.setsampwidth(2)
+            wf.setframerate(rate)
+            wf.writeframes(b"\x00" * (rate * 2))
+        return
 
-            if voice_command:
-                _ = voice_command.result == VoiceCommandResult.FAILURE
-                # Reset
-                audio_data = recorder.stop()
-                if wav_dir:
-                    # Write WAV to directory
-                    wav_path = (wav_dir / wav_filename).with_suffix(".wav")
-                    wav_bytes = buffer_to_wav(audio_data)
-                    wav_path.write_bytes(wav_bytes)
-                    break
-                elif wav_sink:
-                    # Write to WAV file
-                    wav_bytes = buffer_to_wav(audio_data)
-                    if isinstance(wav_sink, Path):
-                        wav_sink.write_bytes(wav_bytes)
-                    break
-            # Next audio chunk
-            chunk = audio_source.read(960, exception_on_overflow=False)
+    frames = []
+    has_started_speaking = False
+    silence_start_time = None
+    start_time = time.time()
+    max_record_time = 15.0  # Max 15 seconds per turn
+
+    try:
+        while True:
+            chunk = audio_stream.read(chunk_size, exception_on_overflow=False)
+            frames.append(chunk)
+
+            rms = calculate_rms(chunk)
+
+            if rms > threshold:
+                if not has_started_speaking:
+                    has_started_speaking = True
+                silence_start_time = None
+            else:
+                if has_started_speaking:
+                    if silence_start_time is None:
+                        silence_start_time = time.time()
+                    elif time.time() - silence_start_time >= silence_seconds:
+                        # User stopped speaking
+                        break
+
+            # If user hasn't spoken for 6 seconds, stop waiting
+            if not has_started_speaking and (time.time() - start_time) > 6.0:
+                break
+
+            # Safety cap
+            if time.time() - start_time > max_record_time:
+                break
 
     finally:
         try:
-            audio_source.close_stream()
+            audio_stream.stop_stream()
+            audio_stream.close()
         except Exception:
             pass
 
+    # Save to WAV file
+    with wave.open(output_path, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(b"".join(frames))
+
 
 if __name__ == "__main__":
+    print("Recording audio test...")
     speech_to_text()
+    print("Saved to audio/recording.wav")
